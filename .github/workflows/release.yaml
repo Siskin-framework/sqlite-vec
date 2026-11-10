@@ -6,7 +6,7 @@ permissions:
   contents: read
 jobs:
   build-linux-x86_64-extension:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: ./scripts/vendor.sh
@@ -16,7 +16,7 @@ jobs:
           name: sqlite-vec-linux-x86_64-extension
           path: dist/*
   build-macos-x86_64-extension:
-    runs-on: macos-15-intel
+    runs-on: macos-13
     steps:
       - uses: actions/checkout@v4
       - run: ./scripts/vendor.sh
@@ -49,16 +49,17 @@ jobs:
         shell: bash
       - run: make sqlite-vec.h
       - run: mkdir dist
-      - run: cl.exe /fPIC -shared /W4 /Ivendor/ /O2 /LD sqlite-vec.c -o dist/vec0.dll
+      - run: cl.exe /fPIC -shared /W4 /Ivendor/ /O2 /DSQLITE_VEC_ENABLE_AVX /LD sqlite-vec.c -o dist/vec0.dll
       - uses: actions/upload-artifact@v4
         with:
           name: sqlite-vec-windows-x86_64-extension
           path: dist/*
   build-linux-aarch64-extension:
-    runs-on: ubuntu-22.04-arm
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
       - run: ./scripts/vendor.sh
+      - run: make sqlite-vec.h
       - run: make loadable static
       - uses: actions/upload-artifact@v4
         with:
@@ -121,8 +122,8 @@ jobs:
           distribution: "temurin"
       - uses: android-actions/setup-android@v3
       - run: |
-          sdkmanager --install "ndk;27.0.12077973"
-          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.0.12077973" >> $GITHUB_ENV
+          sdkmanager --install "ndk;29.0.14206865"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/29.0.14206865" >> $GITHUB_ENV
       - run: |
           ls $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/
           ls $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
@@ -131,7 +132,8 @@ jobs:
           make CC=${{ matrix.platforms.cc }} \
              AR=llvm-ar \
              RANLIB=llvm-ranlib \
-             STRIP=llvm-strip loadable
+             STRIP=llvm-strip \
+             LDFLAGS="-Wl,-z,max-page-size=16384" loadable
       - uses: actions/upload-artifact@v4
         with:
           name: sqlite-vec-${{ matrix.platforms.name }}-extension
@@ -184,7 +186,6 @@ jobs:
     needs:
       [
         build-linux-x86_64-extension,
-        build-linux-aarch64-extension,
         build-macos-x86_64-extension,
         build-macos-aarch64-extension,
         build-windows-x86_64-extension,
@@ -192,11 +193,8 @@ jobs:
         build-android-extensions,
         build-ios-extensions,
       ]
-    environment:
-      name: release
     permissions:
       contents: write
-      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -251,48 +249,42 @@ jobs:
         with:
           name: sqlite-vec-iossimulator-x86_64-extension
           path: dist/iossimulator-x86_64
+      - run: |
+          curl -L https://github.com/asg017/sqlite-dist/releases/download/v0.0.1-alpha.17/sqlite-dist-x86_64-unknown-linux-gnu.tar.xz \
+            | tar xfJ - --strip-components 1
       - run: make sqlite-vec.h
-      - uses: asg017/setup-sqlite-dist@73e37b2ffb0b51e64a64eb035da38c958b9ff6c6
-      - run: sqlite-dist build --set-version $(cat VERSION)
+      - run: ./sqlite-dist ./sqlite-dist.toml --input dist/ --output distx/ --version $(cat VERSION)
       - run: |
           gh release upload ${{ github.ref_name }} \
-            .sqlite-dist/amalgamation/* \
-            .sqlite-dist/github_releases/* \
-            .sqlite-dist/spm/* \
-            .sqlite-dist/sqlpkg/* \
-            .sqlite-dist/checksums.txt \
-            .sqlite-dist/sqlite-dist-manifest.json \
-            .sqlite-dist/install.sh
+            distx/amalgamation/* \
+            distx/github_releases/* \
+            distx/spm/* \
+            distx/sqlpkg/* \
+            distx/checksums.txt \
+            distx/sqlite-dist-manifest.json \
+            distx/install.sh
         env:
           GH_TOKEN: ${{ github.token }}
       - name: Install node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v3
         with:
-          node-version: "24"
+          node-version: "16"
           registry-url: "https://registry.npmjs.org"
       - run: |
-          VERSION=$(cat VERSION)
-          if echo "$VERSION" | grep -q "alpha"; then
-            TAG=alpha
-          elif echo "$VERSION" | grep -q "beta"; then
-            TAG=beta
-          else
-            TAG=latest
-          fi
-          npm publish --provenance --access public --tag $TAG .sqlite-dist/npm/sqlite-vec-darwin-arm64.tar.gz
-          npm publish --provenance --access public --tag $TAG .sqlite-dist/npm/sqlite-vec-darwin-x64.tar.gz
-          npm publish --provenance --access public --tag $TAG .sqlite-dist/npm/sqlite-vec-linux-x64.tar.gz
-          npm publish --provenance --access public --tag $TAG .sqlite-dist/npm/sqlite-vec-linux-arm64.tar.gz
-          npm publish --provenance --access public --tag $TAG .sqlite-dist/npm/sqlite-vec-windows-x64.tar.gz
-          npm publish --provenance --access public --tag $TAG .sqlite-dist/npm/sqlite-vec-wasm-demo.tar.gz
-          npm publish --provenance --access public --tag $TAG .sqlite-dist/npm/sqlite-vec.tar.gz
+          npm publish --access public distx/npm/sqlite-vec-darwin-arm64.tar.gz
+          npm publish --access public distx/npm/sqlite-vec-darwin-x64.tar.gz
+          npm publish --access public distx/npm/sqlite-vec-linux-x64.tar.gz
+          npm publish --access public distx/npm/sqlite-vec-linux-arm64.tar.gz
+          npm publish --access public distx/npm/sqlite-vec-windows-x64.tar.gz
+          npm publish --access public distx/npm/sqlite-vec-wasm-demo.tar.gz
+          npm publish --access public distx/npm/sqlite-vec.tar.gz
         env:
-          NODE_AUTH_TOKEN: ""
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: 3.2
       - run: |
-          for file in .sqlite-dist/gem/*; do
+          for file in distx/gem/*; do
             gem push  "$file"
           done
         env:
@@ -302,9 +294,9 @@ jobs:
           python-version: "3.12"
       - run: pip install twine
       - run: |
-          twine upload .sqlite-dist/pip/*
-          twine upload .sqlite-dist/datasette/*
-          twine upload .sqlite-dist/sqlite_utils/*
+          twine upload distx/pip/*
+          twine upload distx/datasette/*
+          twine upload distx/sqlite_utils/*
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
@@ -325,7 +317,6 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   build-ncruces-go:
-    if: false
     runs-on: ubuntu-latest
     permissions:
       contents: write

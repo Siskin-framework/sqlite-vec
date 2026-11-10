@@ -1,0 +1,242 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+> [!NOTE]
+> This is a community fork of [`asg017/sqlite-vec`](https://github.com/asg017/sqlite-vec) created to merge pending upstream PRs and provide continued support while the original author is unavailable.
+
+`sqlite-vec` is a lightweight, fast vector search SQLite extension written in pure C with no dependencies. It's a pre-v1 project (current: v0.2.9-alpha) that provides vector similarity search capabilities for SQLite databases across all platforms where SQLite runs.
+
+Key features:
+- Supports float, int8, and binary vector types via `vec0` virtual tables
+- Pure C implementation with optional SIMD optimizations (AVX on x86_64, NEON on ARM)
+- Multi-language bindings (Python, Node.js, Ruby, Go, Rust, Lua)
+- Runs anywhere: Linux/MacOS/Windows, WASM, embedded devices
+- Distance constraints for KNN queries (enables pagination and range queries)
+- Optimize command for space reclamation after deletes
+- ALTER TABLE RENAME support for vec0 tables
+
+## Building and Testing
+
+### Build Commands
+
+Run `./scripts/vendor.sh` first to download vendored dependencies (sqlite3.c, shell.c).
+
+**Core builds:**
+- `make loadable` - Build `dist/vec0.{so,dylib,dll}` loadable extension
+- `make static` - Build `dist/libsqlite_vec0.a` static library and `dist/sqlite-vec.h` header
+- `make cli` - Build `dist/sqlite3` CLI with sqlite-vec statically linked
+- `make all` - Build all three targets above
+- `make wasm` - Build WASM version (requires emcc)
+
+**Platform-specific compiler:**
+- Set `CC=` to use a different compiler (default: gcc)
+- Set `AR=` to use a different archiver (default: ar)
+
+**SIMD control:**
+- SIMD follows the compiler's target, read from its predefined macros with the user's `CFLAGS`/`CPPFLAGS` (so `--target` and `--sysroot` are honoured): `__x86_64__` targets get `SQLITE_VEC_ENABLE_AVX`, `__aarch64__` targets get `SQLITE_VEC_ENABLE_NEON`; Android builds stay scalar
+- The AVX and AVX2 kernels carry per-function target attributes and are used only when the running CPU supports them, so no `-mavx` is passed and one x86_64 binary runs on any x86-64 CPU (the native MSVC build still needs POPCNT for bit vectors, through `__popcnt64`)
+- Set `OMIT_SIMD=1` to disable SIMD optimizations. A `CFLAGS=...` given on the `make` command line replaces the Makefile's own additions, these defines included; set `CFLAGS` in the environment, or pass the define yourself
+
+### Testing
+
+**Python tests (primary test suite):**
+```bash
+# Setup test environment with uv
+uv sync --directory tests
+
+# Run all Python tests
+make test-loadable python=./tests/.venv/bin/python
+
+# Run specific test
+./tests/.venv/bin/python -m pytest tests/test-loadable.py::test_name -vv -s -x
+
+# Update snapshots
+make test-loadable-snapshot-update
+
+# Watch mode
+make test-loadable-watch
+```
+
+**Other tests:**
+- `make test` - Run basic SQL tests via `test.sql`
+- `make test-unit` - Compile and run C unit tests (`tests/test-unit.c`)
+- `cargo test --manifest-path tests/Cargo.toml` - Rust harness for internal C functions (`tests/unittest.rs`)
+- `sqlite3 :memory: '.read test.sql'` - Quick smoke test
+
+**Test structure:**
+- `tests/test-loadable.py` - Main comprehensive test suite
+- `tests/test-metadata.py` - Metadata column tests
+- `tests/test-auxiliary.py` - Auxiliary column tests
+- `tests/test-partition-keys.py` - Partition key tests
+- `tests/conftest.py` - pytest fixtures (loads extension from `dist/vec0`)
+
+### Code Quality
+
+- `make format` - Format C code with clang-format and Python with black
+- `make lint` - Check formatting without modifying files
+
+## Architecture
+
+### Core Implementation (sqlite-vec.c)
+
+The entire extension is in a single `sqlite-vec.c` file (~9000 lines). It implements a `vec0` virtual table module using SQLite's virtual table API.
+
+**Key concepts:**
+
+1. **vec0 virtual table**: Declared with `CREATE VIRTUAL TABLE x USING vec0(vector_column TYPE[N], ...)`
+   - Vector column: Must specify type (float, int8, bit) and dimensions
+   - Metadata columns: Additional indexed columns for filtering
+   - Auxiliary columns: Non-indexed columns for associated data
+   - Partition keys: Special columns for pre-filtering via `partition_key=column_name`
+   - Chunk size: Configurable via `chunk_size=N` (default varies by type)
+
+2. **Shadow tables**: vec0 creates multiple hidden tables to store data:
+   - `xyz_chunks` - Chunk metadata (size, validity bitmaps, rowids)
+   - `xyz_rowids` - Rowid mapping to chunks
+   - `xyz_vector_chunksNN` - Actual vector data for column NN
+   - `xyz_auxiliary` - Auxiliary column values
+   - `xyz_metadatachunksNN` / `xyz_metadatatextNN` - Metadata storage
+
+3. **Query plans**: Determined in xBestIndex, encoded in idxStr:
+   - `VEC0_QUERY_PLAN_FULLSCAN` - Full table scan
+   - `VEC0_QUERY_PLAN_POINT` - Single rowid lookup
+   - `VEC0_QUERY_PLAN_KNN` - K-nearest neighbors vector search
+
+See ARCHITECTURE.md for detailed idxStr encoding and shadow table schemas.
+
+### Language Bindings
+
+All bindings wrap the core C extension:
+
+- **Go CGO** (`bindings/go/cgo/`): CGO-based bindings for mattn/go-sqlite3
+  - `Auto()` function to register extension via `sqlite3_auto_extension()`
+  - `SerializeFloat32()` and `SerializeInt8()` helper functions
+  - Requires CGO enabled and links libm (`-lm`)
+
+- **Python**: Installable via pip from GitHub
+  - Package configuration in `pyproject.toml` and `setup.py`
+  - Helper functions in `bindings/python/extra_init.py` for vector serialization
+  - Requires Python built with `--enable-loadable-sqlite-extensions`
+  - Recommend using `uv` for virtual environments (uses system Python with extension support)
+
+- **Node.js**: Installable via npm from GitHub
+  - Package configuration in `package.json`
+  - CJS (`index.cjs`) and ESM (`index.mjs`) entry points
+  - TypeScript definitions in `index.d.ts`
+
+- **Ruby**: Installable via gem from GitHub
+  - Gem specification in `sqlite-vec.gemspec`
+  - Extension configuration in `extconf.rb`
+  - Ruby library in `lib/sqlite_vec.rb`
+
+- **Rust** (`bindings/rust/`): Static linking via build.rs
+  - Crate configuration in `Cargo.toml`
+  - Exports `sqlite3_vec_init()` in `src/lib.rs`
+
+- **Lua** (`bindings/lua/`): Lua 5.1+ compatible binding
+  - Requires `lsqlite3` module
+  - `load()` function to load the extension
+  - `serialize_f32()` for IEEE 754 binary format
+  - `serialize_json()` for JSON format
+  - Example in `examples/simple-lua/`
+
+### Documentation Site
+
+Built with VitePress (Vue-based static site generator):
+- `npm --prefix site run dev` - Development server
+- `npm --prefix site run build` - Production build
+- Source: `site/` directory
+- Deployed via GitHub Actions (`.github/workflows/site.yaml`)
+
+## Development Workflow
+
+### Making Changes
+
+1. Edit `sqlite-vec.c` for core functionality
+2. Update `sqlite-vec.h.tmpl` if public API changes (regenerated via `make sqlite-vec.h`)
+3. Add tests to `tests/test-loadable.py` or other test files
+4. Run `make format` before committing
+5. Verify with `make test-loadable`
+
+### Release Process
+
+**For this fork:**
+
+1. Update `VERSION` file (format: `X.Y.Z` or `X.Y.Z-alpha.N`)
+2. Update `CHANGELOG.md` with changes
+3. Commit changes with descriptive message
+4. Create and push git tag:
+   ```bash
+   git tag v0.X.Y-alpha
+   git push origin v0.X.Y-alpha
+   ```
+
+**Note:** This fork does not have CI/CD publishing to package registries (PyPI, npm, crates.io, RubyGems).
+Users install directly from GitHub using version tags.
+
+**Original release process (for reference only):**
+The original repository uses `./scripts/publish-release.sh` and CI/CD (`.github/workflows/release.yaml`) to build and publish platform-specific extensions and language packages.
+
+**Future work: `.github/workflows/release.yaml`**
+
+The Release workflow has never run on this fork (it triggers on a published GitHub release, and the fork only pushes tags) and cannot complete a run as it stands. As of v0.2.7-alpha:
+
+- It has drifted from `test.yaml`, where these are already fixed:
+  - `android-actions/setup-android@v3` should be `@v4` (v3 installs the removed `tools` SDK package and fails during setup)
+  - `runs-on: macos-13` should be `macos-15-intel` (retired runner)
+  - `runs-on: macos-14` and the iOS matrix's `runner: macos-14` should be `macos-15` (retired in November 2026; `test.yaml` and `fuzz.yaml` were moved to `macos-15` in v0.2.8-alpha)
+  - `runs-on: windows-2019` should be `windows-2022` (retired runner)
+  - the `ncruces/go-sqlite3` checkout should be pinned with `ref: v0.30.5` (the patch does not apply to later layouts)
+- The `dist` and `upload-crate` jobs publish to npm, RubyGems, PyPI and crates.io under upstream's package names, using secrets the fork does not have, and `build-ncruces-go` pushes to another repository with a personal access token.
+- `actions/setup-node@v3` and `actions-rs/toolchain@v1` have not been checked and may also be stale.
+
+Options, not yet decided: sync the four lines and keep it as a reference copy; trim it to build the extensions and attach them to a GitHub release (dropping the registry and ncruces jobs), which would give users prebuilt binaries; or make it manual-only or delete it. Nothing in it can be tested without publishing a release.
+
+### Working with Tests
+
+**Python test fixtures:**
+- `@pytest.fixture() db()` in conftest.py provides SQLite connection with extension loaded
+- Tests use `db.execute()` for queries
+- Snapshot testing available for regression tests
+
+**Common test patterns:**
+```python
+def test_example(db):
+    db.execute("CREATE VIRTUAL TABLE v USING vec0(embedding float[3])")
+    db.execute("INSERT INTO v(rowid, embedding) VALUES (1, '[1,2,3]')")
+    result = db.execute("SELECT distance FROM v WHERE embedding MATCH '[1,2,3]'").fetchone()
+```
+
+### SIMD Optimizations
+
+SIMD is conditionally compiled based on platform:
+- `SQLITE_VEC_ENABLE_AVX` - x86_64 AVX and AVX2 kernels (`l2_sqr_float_avx`, `distance_hamming_avx2`), compiled with per-function target attributes (`VEC_TARGET_AVX`, `VEC_TARGET_AVX2`) and dispatched at run time through `VEC_CPU_SUPPORTS_AVX()` / `VEC_CPU_SUPPORTS_AVX2()` (`__builtin_cpu_supports` on GCC and Clang; on Windows, native MSVC and clang-cl alike, `__cpuid` plus `_xgetbv` cached in an interlocked variable, since clang-cl's builtin needs compiler-rt at link time), so the define is safe on any x86-64 build
+- `SQLITE_VEC_ENABLE_NEON` - ARM NEON instructions (part of the AArch64 baseline, no dispatch needed)
+
+Code uses preprocessor directives to select implementations. Distance calculations have both scalar and SIMD variants. The Rust binding's `build.rs` and the Go CGO `#cgo` lines set the same defines by target architecture.
+
+## Important Notes
+
+- This is pre-v1 software - breaking changes are expected
+- The single-file architecture means recompiling for any change
+- Tests must run from repository root (assumes `dist/vec0` exists)
+- All bindings depend on the core C extension being built first
+- Vector format: JSON arrays `'[1,2,3]'` or raw bytes via helper functions
+
+**Fork-specific notes:**
+- Version v0.2.9-alpha includes: fixes for open upstream bug reports found to apply to the fork: ghost rows after a failed INSERT (upstream #333), partition key `in (...)` lists handled in one KNN pass (#142), UPDATE on partition-keyed tables with any WHERE clause (#261), UPDATE and DELETE driven by a KNN query, `UPDATE ... SET rowid` refused instead of ignored (#332), L2 at extreme float32 magnitudes (#334, #335), raw int8 and bit vectors accepted by their columns (#361), BOOLEAN range check; upstream PRs ported: vec_each bit order (#323), 64-bit int8 L1 (#365), exact vector type names (#310), double-quoted column names (#296, issue #170); runtime AVX dispatch (#302, after PR #307) so one x86_64 binary is safe on any x86-64 CPU and Linux, Windows, Rust and Go builds get AVX; `make cli` optimised, FreeBSD-safe header recipe, CI builds a 64-bit linux-aarch64 artifact and 16KB-aligned Android libraries with NDK 29, SPDX licence identifiers, npm installs on Termux. Works around a SQLite 3.53.0/3.53.1 bug (`sqlite3_value_numeric_type()` on a duplicated value) by converting IN-list values before copying them
+- Version v0.2.8-alpha includes: KNN filters that keep exactly the rows SQLite keeps, with typed columns, affinity, collations and UTF-16 ordering (#12), KNN arguments from a joined table (#14), NEON cosine kernels (#20) and NEON on Linux arm64 (#21), full scans through one blob handle per chunk (#17), a heap for each chunk's k nearest (#18), binary search for integer `in (...)` lists (#10), MMR running maximum (#11), skipping chunks the filters empty (#13), `rowid in (...)` fix for far-apart rowids (#9), DELETE validity fixes (#25, #26), static blob heap overflow and leak fixes (#19), GNU ld link order for `make cli` (#22), MSVC static header and `SQLITE_CORE` warning fixes (#24, #23); all from MayCXC
+- Version v0.2.7-alpha includes: cosine distance and `vec_normalize` fix for very small and very large float32 vectors (upstream #324), `xShadowName` now reports `vector_chunksNN` tables (partial, see "Identifying shadow tables" in ARCHITECTURE.md, upstream #320), `NPY_MAGIC` initialiser fix for newer GCC/Clang and C++ (upstream #321)
+- Version v0.2.6-alpha includes: upstream correctness fixes ported from v0.1.8-v0.1.10 (NEON int8 L2 overflow, DELETE on long text metadata, NaN/Inf input rejection, UB fixes), INSERT OR REPLACE support, empty-chunk reclamation on DELETE, NEON/AVX2 SIMD Hamming distance, libFuzzer targets with nightly CI
+- Version v0.2.5-alpha includes: MMR reranking via `mmr_lambda` hidden column (#6), memory leak fixes (#7), NULL/rejection handling for zero-magnitude vectors with cosine distance (#8), duplicate Rust package removal (#4)
+- Version v0.2.4-alpha includes: Lua binding with IEEE 754 compliant float serialization (#237)
+- Version v0.2.3-alpha includes: Android 16KB page support (#254), LDFLAGS support, documentation fixes (#208, #209)
+- Version v0.2.2-alpha includes: GLOB operator for text metadata (#191), IS/IS NOT/IS NULL/IS NOT NULL operators (#190), all compilation warnings fixed (including critical logic bug)
+- Version v0.2.1-alpha includes: LIKE operator for text metadata (#197), locale-independent JSON parsing (#241), musl libc compilation fix
+- Version v0.2.0-alpha merged upstream PRs: #166 (distance constraints), #210 (optimize), #203 (ALTER TABLE RENAME), #212 (cosine distance for binary), #243 (delete memory leak fix), #228 (CI/CD updates)
+- See CHANGELOG.md for complete list of changes from original v0.1.7-alpha.2
+- Installation is via GitHub (git tags), not package registries
+- Python users should use `uv` for virtual environments to ensure loadable extension support

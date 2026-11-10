@@ -20,17 +20,17 @@ SUPPORTS_VTAB_IN = sqlite3.sqlite_version_info[1] >= 38
 SUPPORTS_VTAB_LIMIT = sqlite3.sqlite_version_info[1] >= 41
 
 
-def bitmap_full(n: int) -> bytearray:
+def bitmap_full(n: int) -> bytes:
     assert (n % 8) == 0
     return bytes([0xFF] * int(n / 8))
 
 
-def bitmap_zerod(n: int) -> bytearray:
+def bitmap_zerod(n: int) -> bytes:
     assert (n % 8) == 0
     return bytes([0x00] * int(n / 8))
 
 
-def f32_zerod(n: int) -> bytearray:
+def f32_zerod(n: int) -> bytes:
     return bytes([0x00, 0x00, 0x00, 0x00] * int(n))
 
 
@@ -97,6 +97,7 @@ def spread_args(args):
 
 
 FUNCTIONS = [
+    "vec0_partition_in",
     "vec_add",
     "vec_bit",
     "vec_debug",
@@ -264,6 +265,19 @@ def test_vec_static_blob_entries():
     ]
 
 
+def test_vec_static_blob_entries_knn_with_whole_candidate_bytes():
+    # 64 vectors fill the KNN's candidate bitmap to its last byte. The blob
+    # reads the array's memory, so the array stays referenced while it is queried.
+    db = connect(EXT_PATH, extra_entrypoint="sqlite3_vec_static_blobs_init")
+    vectors = np.array([[i / 64] * 4 for i in range(64)], np.float32)
+    register_numpy(db, "w", vectors)
+    rows = db.execute(
+        "select rowid from w where vector match ? and k = 3 order by distance",
+        [np.array([0.5] * 4, dtype=np.float32)],
+    ).fetchall()
+    assert [r[0] for r in rows] == [32, 33, 31]
+
+
 def test_limits():
     db = connect(EXT_PATH)
     with _raises(
@@ -406,22 +420,136 @@ def test_vec_distance_cosine():
         f"select vec_distance_cosine({a}, {b})", args
     ).fetchone()[0]
 
-    def check(a, b, dtype=np.float32):
+    def check(a, b, dtype: type = np.float32):
         if dtype == np.float32:
             transform = "?"
         elif dtype == np.int8:
             transform = "vec_int8(?)"
+        else:
+            raise ValueError(f"unsupported dtype: {dtype}")
         a = np.array(a, dtype=dtype)
         b = np.array(b, dtype=dtype)
 
         x = vec_distance_cosine(a, b, a=transform, b=transform)
-        y = npy_cosine(a, b)
+        # the reference in float64: numpy sums int8 products in int8
+        y = npy_cosine(a.astype(np.float64), b.astype(np.float64))
         assert isclose(x, y, abs_tol=1e-6)
 
     check([1.2, 0.1], [0.4, -0.4])
     check([-1.2, -0.1], [-0.4, 0.4])
     check([1, 2, 3], [-9, -8, -7], dtype=np.int8)
-    assert vec_distance_cosine("[1.1, 1.0]", "[1.2, 1.2]") == 0.001131898257881403
+    assert vec_distance_cosine("[1.1, 1.0]", "[1.2, 1.2]") == 0.0011318627512082458
+
+    # lengths past the SIMD kernels' thresholds, with and without a remainder
+    # past their 16-element blocks
+    rng = np.random.default_rng(324)
+    for n in [17, 31, 32, 40, 127, 768]:
+        check(rng.uniform(-1, 1, n), rng.uniform(-1, 1, n))
+        check(rng.integers(-128, 128, n), rng.integers(-128, 128, n), dtype=np.int8)
+    # check overflow of 32-bit sums. Squares of 128 (2^14) and 64 (2^12) keep
+    # every partial sum exact in f32, so the scalar build matches too.
+    # 131,072 squares of 128 sum to 2^31, past INT32_MAX:
+    check([-128] * 131072, [-128] * 131072, dtype=np.int8)
+    # 2^32 in total, which wraps a 32-bit sum to 0:
+    check([64] * 1048576, [-64] * 1048576, dtype=np.int8)
+    # 32-bit partial sums of every 8th square reach 2^31, so widening only the
+    # final sum to 64 bits is not enough:
+    check([-128] * 1048576, [-128] * 1048576, dtype=np.int8)
+
+    vec_distance_cosine_bit = lambda *args: db.execute(
+        "select vec_distance_cosine(vec_bit(?), vec_bit(?))", args
+    ).fetchone()[0]
+    assert isclose(
+        vec_distance_cosine_bit(b"\xff", b"\x01"),
+        npy_cosine([1,1,1,1,1,1,1,1], [0,0,0,0,0,0,0,1]),
+        abs_tol=1e-6
+    )
+    assert isclose(
+        vec_distance_cosine_bit(b"\xab", b"\xab"),
+        npy_cosine([1,0,1,0,1,0,1,1], [1,0,1,0,1,0,1,1]),
+        abs_tol=1e-6
+    )
+    # test 64-bit
+    assert isclose(
+        vec_distance_cosine_bit(b"\xaa" * 8, b"\xff" * 8),
+        npy_cosine([1,0] * 32, [1] * 64),
+        abs_tol=1e-6
+    )
+
+
+def test_vec_distance_cosine_zero_vector():
+    # cosine distance is undefined for zero-magnitude vectors; NULL is
+    # returned instead of NaN, which poisons distance orderings
+    # https://github.com/vlasky/sqlite-vec/issues/8
+    distance = lambda sql, *args: db.execute(sql, args).fetchone()[0]
+    assert distance("select vec_distance_cosine('[0,0,0]', '[1,2,3]')") is None
+    assert distance("select vec_distance_cosine('[1,2,3]', '[0,0,0]')") is None
+    assert distance("select vec_distance_cosine('[0,0,0]', '[0,0,0]')") is None
+    assert (
+        distance(
+            "select vec_distance_cosine(vec_int8(?), vec_int8(?))",
+            _int8([0, 0]),
+            _int8([1, 2]),
+        )
+        is None
+    )
+    assert (
+        distance("select vec_distance_cosine(vec_bit(?), vec_bit(?))", b"\x00", b"\xff")
+        is None
+    )
+
+
+def test_vec_distance_cosine_extreme_magnitudes():
+    # squaring very small or very large f32 elements used to underflow or
+    # overflow the f32 magnitude accumulators, returning +-Inf, NaN or a wrong
+    # distance for nonzero finite vectors
+    # https://github.com/asg017/sqlite-vec/issues/324
+    vec_distance_cosine = lambda a, b: db.execute(
+        "select vec_distance_cosine(?, ?)", [_f32(a), _f32(b)]
+    ).fetchone()[0]
+
+    # the same 2-element vectors padded to 40 elements, past the SIMD kernels'
+    # threshold, with a remainder past their 16-element blocks
+    for pad in [0, 38]:
+        z = [0] * pad
+        for scale in [1e-45, 1e-30, 1e-25, 1e-20, 1.0, 1e20, 3e38]:
+            # cosine distance is invariant under positive scaling
+            assert vec_distance_cosine([1, 0] + z, [scale, 0] + z) == 0.0
+            assert vec_distance_cosine([scale, 0] + z, [1, 0] + z) == 0.0
+            assert vec_distance_cosine([scale, 0] + z, [scale, 0] + z) == 0.0
+            assert vec_distance_cosine([1, 0] + z, [-scale, 0] + z) == 2.0
+            assert vec_distance_cosine([1, 0] + z, [0, scale] + z) == 1.0
+            assert isclose(
+                vec_distance_cosine([1, 0] + z, [scale, scale] + z),
+                1 - 1 / np.sqrt(2),
+                abs_tol=1e-6,
+            )
+
+
+def test_ensure_vector_match_cleanup_on_second_vector_error():
+    """
+    Test that ensure_vector_match properly cleans up the first vector
+    when the second vector fails to parse.
+
+    This tests the fix for a bug where aCleanup(a) was called instead of
+    aCleanup(*a), passing the wrong pointer to the cleanup function.
+
+    The bug only manifests when the first vector is parsed from JSON/TEXT
+    (which uses sqlite3_free as cleanup) rather than BLOB (which uses noop).
+    """
+    # Valid first vector as JSON text - this causes memory allocation
+    # and sets cleanup to sqlite3_free
+    valid_vector_json = "[1.0, 2.0, 3.0, 4.0]"
+
+    # Invalid second vector: 5 bytes, not divisible by 4 (sizeof float32)
+    # This will fail in fvec_from_value with "invalid float32 vector BLOB length"
+    invalid_vector = b"\x01\x02\x03\x04\x05"
+
+    with pytest.raises(sqlite3.OperationalError, match=r"^Error reading 2nd vector: invalid float32 vector BLOB length\. Must be divisible by 4, found 5$"):
+        db.execute(
+            "select vec_distance_cosine(?, ?)",
+            [valid_vector_json, invalid_vector]
+        ).fetchone()
 
 
 def test_vec_distance_hamming():
@@ -431,6 +559,17 @@ def test_vec_distance_hamming():
     assert vec_distance_hamming(b"\xff", b"\x00") == 8
     assert vec_distance_hamming(b"\xff", b"\x01") == 7
     assert vec_distance_hamming(b"\xab", b"\xab") == 0
+
+    # large vectors exercise the SIMD paths (NEON at >=128 dims, AVX2 at
+    # >=32 bytes) including their main loops and scalar tails
+    import random
+
+    rng = random.Random(42)
+    for n_bytes in (16, 24, 32, 128, 200, 512):
+        a = bytes(rng.randrange(256) for _ in range(n_bytes))
+        b = bytes(rng.randrange(256) for _ in range(n_bytes))
+        expected = sum(bin(x ^ y).count("1") for x, y in zip(a, b))
+        assert vec_distance_hamming(a, b) == expected
 
     with pytest.raises(
         sqlite3.OperationalError,
@@ -450,11 +589,13 @@ def test_vec_distance_l1():
         f"select vec_distance_l1({a}, {b})", args
     ).fetchone()[0]
 
-    def check(a, b, dtype=np.float32):
+    def check(a, b, dtype: type = np.float32):
         if dtype == np.float32:
             transform = "?"
         elif dtype == np.int8:
             transform = "vec_int8(?)"
+        else:
+            raise ValueError(f"unsupported dtype: {dtype}")
 
         a_sql_t = np.array(a, dtype=dtype)
         b_sql_t = np.array(b, dtype=dtype)
@@ -507,27 +648,102 @@ def test_vec_distance_l1():
     )
 
 
+def test_vec_huge_exponent():
+    # exponents large enough to overflow the int accumulator in strtod_c
+    # are clamped and rejected as out of range
+    with pytest.raises(sqlite3.OperationalError, match="JSON parsing error"):
+        db.execute("select vec_length('[1e440444444]')")
+    with pytest.raises(sqlite3.OperationalError, match="JSON parsing error"):
+        db.execute("select vec_length('[1e99999999999999999999]')")
+    assert db.execute("select vec_length('[1e3, 2e-2]')").fetchone()[0] == 2
+
+
+def test_vec0_constructor_truncated_definitions():
+    # incomplete or garbled column definitions must fail cleanly; the token
+    # scanner previously read stale token state when input ended early
+    for construct in [
+        "aa",
+        "aa float",
+        "aa float[",
+        "aa float[4",
+        "bb text partition",
+        "cc text primary",
+        "\xe1aa float[12], bbb int8[6]",
+        "chunk_size",
+        "chunk_size=",
+    ]:
+        with pytest.raises(sqlite3.OperationalError):
+            db.execute(f"create virtual table bad_v using vec0({construct})")
+
+
+def test_vec_reject_nan_inf():
+    # NaN and Inf elements break KNN heap/sort invariants, so they are
+    # rejected at parse time for both blob and JSON input
+    nan_blob = struct.pack("4f", 1.0, float("nan"), 3.0, 4.0)
+    with pytest.raises(sqlite3.OperationalError, match="element 1 is NaN"):
+        db.execute("select vec_length(?)", [nan_blob])
+
+    inf_blob = struct.pack("4f", 1.0, float("inf"), 3.0, 4.0)
+    with pytest.raises(sqlite3.OperationalError, match="element 1 is Inf"):
+        db.execute("select vec_length(?)", [inf_blob])
+
+    ninf_blob = struct.pack("4f", 1.0, float("-inf"), 3.0, 4.0)
+    with pytest.raises(sqlite3.OperationalError, match="element 1 is Inf"):
+        db.execute("select vec_length(?)", [ninf_blob])
+
+    # the locale-independent strtod_c does not parse nan/inf literals, so
+    # JSON input is rejected at parse time with a generic error
+    with pytest.raises(
+        sqlite3.OperationalError, match="JSON parsing error|element 1 is NaN"
+    ):
+        db.execute("select vec_length('[1.0, nan, 3.0]')")
+
+    with pytest.raises(
+        sqlite3.OperationalError, match="JSON parsing error|element 1 is Inf"
+    ):
+        db.execute("select vec_length('[1.0, inf, 3.0]')")
+
+    ok_blob = struct.pack("4f", 1.0, 2.0, 3.0, 4.0)
+    assert db.execute("select vec_length(?)", [ok_blob]).fetchone()[0] == 4
+
+
 def test_vec_distance_l2():
     vec_distance_l2 = lambda *args, a="?", b="?": db.execute(
         f"select vec_distance_l2({a}, {b})", args
     ).fetchone()[0]
 
-    def check(a, b, dtype=np.float32):
+    def check(a, b, dtype: type = np.float32):
         if dtype == np.float32:
             transform = "?"
         elif dtype == np.int8:
             transform = "vec_int8(?)"
+        else:
+            raise ValueError(f"unsupported dtype: {dtype}")
 
         a_sql_t = np.array(a, dtype=dtype)
         b_sql_t = np.array(b, dtype=dtype)
 
         x = vec_distance_l2(a_sql_t, b_sql_t, a=transform, b=transform)
         y = npy_l2(np.array(a), np.array(b))
-        assert isclose(x, y, abs_tol=1e-6)
+        assert isclose(x, y, rel_tol=1e-5, abs_tol=1e-6)
 
     check([1.2, 0.1], [0.4, -0.4])
     check([-1.2, -0.1], [-0.4, 0.4])
     check([1, 2, 3], [-9, -8, -7], dtype=np.int8)
+    # extreme int8 values: diff=255, squared=65025, which overflows i16 in
+    # the NEON widening-multiply path
+    check([-128] * 8, [127] * 8, dtype=np.int8)
+    check([-128] * 16, [127] * 16, dtype=np.int8)
+    check(
+        [-128, 127, -128, 127, -128, 127, -128, 127],
+        [127, -128, 127, -128, 127, -128, 127, -128],
+        dtype=np.int8,
+    )
+    # the NEON kernel sums the squares in an integer, which 65025 per element
+    # overflows in 32 bits from 33,026 elements at opposite extremes; 33,032
+    # is a multiple of eight, so it also exercises a tail-free run
+    for n in [33025, 33026, 33032]:
+        check([-128] * n, [127] * n, dtype=np.int8)
 
 
 def test_vec_length():
@@ -589,6 +805,23 @@ def test_vec_normalize():
         -0.3162277638912201,
         -0.6324555277824402,
     ]
+
+    # a zero-magnitude vector cannot be normalized; NULL is returned instead
+    # of a vector of NaNs (https://github.com/vlasky/sqlite-vec/issues/8)
+    assert vec_normalize(_f32([0, 0, 0, 0])) is None
+    assert db.execute("select vec_normalize('[0,0,0]')").fetchone()[0] is None
+
+    # small and large nonzero vectors are normalized rather than treated as
+    # zero-magnitude or returned as a zero vector, the squared magnitude used
+    # to underflow/overflow f32
+    # https://github.com/asg017/sqlite-vec/issues/324
+    for scale in [1e-45, 1e-30, 1e-25, 1e-22, 1e-20, 1e20, 3e38]:
+        assert vec_normalize(_f32([scale, 0])) == _f32([1, 0])
+        assert vec_normalize(_f32([0, -scale])) == _f32([0, -1])
+        assert np.allclose(
+            np.frombuffer(vec_normalize(_f32([scale, scale])), dtype=np.float32),
+            [1 / np.sqrt(2)] * 2,
+        )
 
 
 def test_vec_slice():
@@ -951,6 +1184,54 @@ def test_vec0_inserts():
     db.execute("insert into txt_pk(txt_id, aaa) values ('b', '[2,2,2,2]')")
 
 
+def test_vec0_locale_independent():
+    """Test that JSON float parsing is locale-independent (issue #241)"""
+    import locale
+
+    db = connect(EXT_PATH)
+    db.execute("create virtual table v using vec0(embedding float[3])")
+
+    # Test with C locale first (baseline)
+    db.execute("insert into v(rowid, embedding) values (1, '[0.1, 0.2, 0.3]')")
+
+    # Try to set a non-C locale that uses comma as decimal separator
+    # Common locales: fr_FR, de_DE, it_IT, es_ES, pt_BR, etc.
+    test_locales = ['fr_FR.UTF-8', 'de_DE.UTF-8', 'it_IT.UTF-8', 'C.UTF-8']
+    locale_set = False
+    original_locale = locale.setlocale(locale.LC_NUMERIC)
+
+    for test_locale in test_locales:
+        try:
+            locale.setlocale(locale.LC_NUMERIC, test_locale)
+            locale_set = True
+            break
+        except locale.Error:
+            continue
+
+    try:
+        # Even with non-C locale, JSON parsing should work (using dot as decimal separator)
+        # Before the fix, this would fail in French/German/etc locales
+        db.execute("insert into v(rowid, embedding) values (2, '[0.4, 0.5, 0.6]')")
+
+        # Verify the data was inserted correctly
+        result = db.execute("select embedding from v where rowid = 2").fetchone()
+        expected = _f32([0.4, 0.5, 0.6])
+        assert result[0] == expected, f"Expected {expected}, got {result[0]}"
+
+        # Also verify with different decimal values
+        db.execute("insert into v(rowid, embedding) values (3, '[1.23, 4.56, 7.89]')")
+        result = db.execute("select embedding from v where rowid = 3").fetchone()
+        expected = _f32([1.23, 4.56, 7.89])
+        assert result[0] == expected, f"Expected {expected}, got {result[0]}"
+
+    finally:
+        # Restore original locale
+        locale.setlocale(locale.LC_NUMERIC, original_locale)
+
+    # If we couldn't set a non-C locale, the test still passes (baseline check)
+    # but we didn't really test the locale-independence
+
+
 def test_vec0_insert_errors2():
     db = connect(EXT_PATH)
     db.execute("create virtual table t1 using vec0(aaa float[4], chunk_size=8)")
@@ -1210,6 +1491,14 @@ def test_vec0_delete_errors():
     ):
         db.execute("delete from t1 where rowid = 1")
     db.rollback()
+    # only the row's own bit counts, not a higher one in the same byte
+    db.execute("begin")
+    db.execute("UPDATE t1_chunks SET validity = x'02'")
+    with _raises(
+        "vec0 deletion error: validity bit is not set for main.t1_chunks.1 at 0"
+    ):
+        db.execute("delete from t1 where rowid = 1")
+    db.rollback()
 
     # EVIDENCE-OF: V21193_05263 vec0 DELETE raises error on validity blob error
     db.commit()
@@ -1421,6 +1710,56 @@ def test_vec0_point():
     assert execute_all(db, "select * from t2 where id = 'xxx'") == []
 
 
+def test_vec0_rowid_constraint_values():
+    # vec0 declares the rowid INTEGER and a text primary key TEXT, so the rowid
+    # lookups it makes itself have to keep the rows SQLite keeps for the same
+    # constraint: the rows of `plain`, declared alike, and the rows of SQLite's
+    # own scan of the vec0 table (`or 0` keeps vec0 from handling it).
+    db = connect(EXT_PATH)
+    db.execute("create virtual table v using vec0(a float[1], chunk_size=8)")
+    db.execute("create table plain(id integer primary key)")
+    for rowid in [0, 1, 5, 6]:
+        db.execute("insert into v(rowid, a) values (?, ?)", [rowid, f"[{rowid}]"])
+        db.execute("insert into plain values (?)", [rowid])
+
+    def rowids(sql, parameters=()):
+        return sorted(row[0] for row in db.execute(sql, parameters))
+
+    mismatches = []
+    for value in [None, 5, 5.0, 5.5, "5", " 5 ", "5e0", "abc", "", b"\x05", 2**63 - 1, 1e19]:
+        want_in = rowids("select id from plain where id in (?, 6)", [value])
+        want_eq = rowids("select id from plain where id = ?", [value])
+        for sql, want in [
+            ("select rowid from v where a match '[0]' and k = 10 and rowid in (?, 6)", want_in),
+            ("select rowid from v where rowid = ?", want_eq),
+            ("select rowid from v where (rowid = ? or 0)", want_eq),
+        ]:
+            if rowids(sql, [value]) != want:
+                mismatches.append((sql, value, rowids(sql, [value]), want))
+
+    db.execute("create virtual table t using vec0(id text primary key, a float[1], chunk_size=8)")
+    db.execute("create table plain_t(id text primary key)")
+    for id in ["a", "A", "b", "5", "c  "]:
+        db.execute("insert into t(id, a) values (?, '[1]')", [id])
+        db.execute("insert into plain_t values (?)", [id])
+    for where in [
+        "id in ('a', 'missing', null)",
+        "id in (5, 'b')",
+        "id collate nocase in ('A', 'missing')",
+        "id collate rtrim in ('c', 'b ')",
+        "id = 'A' collate nocase",
+        "id = 5",
+    ]:
+        want = rowids(f"select id from plain_t where {where}")
+        for sql in [
+            f"select id from t where a match '[0]' and k = 10 and {where}",
+            f"select id from t where {where}",
+        ]:
+            if rowids(sql) != want:
+                mismatches.append((sql, None, rowids(sql), want))
+    assert mismatches == []
+
+
 def test_vec0_text_pk():
     db = connect(EXT_PATH)
     db.execute(
@@ -1428,7 +1767,7 @@ def test_vec0_text_pk():
           create virtual table t using vec0(
             t_id text primary key,
             aaa float[1],
-            bbb float8[1],
+            bbb float[1],
             chunk_size=8
           );
         """
@@ -1499,7 +1838,7 @@ def test_vec0_text_pk():
 
     if SUPPORTS_VTAB_IN:
         assert re.match(
-            ("SCAN (TABLE )?t VIRTUAL TABLE INDEX 0:3{___}___\[___"),
+            (r"SCAN (TABLE )?t VIRTUAL TABLE INDEX 0:3{___}___\[___"),
             explain_query_plan(
                 "select t_id, distance from t where aaa match '' and k = 3 and t_id in ('t_2', 't_3')",
                 db=db,
@@ -1545,7 +1884,7 @@ def test_vec0_best_index():
         """
           create virtual table t using vec0(
             aaa float[1],
-            bbb float8[1]
+            bbb float[1]
           );
         """
     )
@@ -1599,7 +1938,7 @@ from contextlib import contextmanager
 
 
 @contextmanager
-def _raises(message, error=sqlite3.OperationalError):
+def _raises(message, error: type[Exception] = sqlite3.OperationalError):
     with pytest.raises(error, match=re.escape(message)):
         yield
 
@@ -2000,6 +2339,39 @@ def test_vec0_create_errors():
     # db.rollback()
 
 
+@pytest.mark.skipif(
+    not SUPPORTS_VTAB_IN, reason="requires vtab `x in (...)` support in SQLite >=3.38"
+)
+def test_vec0_knn_rowid_in_far_apart():
+    # 2**32 + 1 and 1 differ by exactly 2**32, which narrows to 0 as an int,
+    # so a comparator that returns the difference reads them as equal.
+    db = connect(EXT_PATH)
+    db.execute("create virtual table v using vec0(a float[1], chunk_size=8)")
+    db.executemany(
+        "insert into v(rowid, a) values (?, ?)",
+        [(1, "[1]"), (2, "[2]"), (2**32 + 1, "[3]")],
+    )
+    rows = execute_all(
+        db, "select rowid from v where a match '[0]' and k = 10 and rowid in (1, 2)"
+    )
+    assert [row["rowid"] for row in rows] == [1, 2]
+
+    # Differences that overflow an int sort the list out of order, and the
+    # search then misses rowids that are in it.
+    ids = [(-1) ** i * (i + 1) * 3_000_000_000 + i for i in range(5)]
+    db.execute("delete from v")
+    db.executemany(
+        "insert into v(rowid, a) values (?, ?)",
+        [(rowid, f"[{i}]") for i, rowid in enumerate(ids)],
+    )
+    rows = execute_all(
+        db,
+        "select rowid from v where a match '[0]' and k = 10 and rowid in (select value from json_each(?))",
+        [json.dumps(ids)],
+    )
+    assert sorted(row["rowid"] for row in rows) == sorted(ids)
+
+
 def test_vec0_knn():
     db = connect(EXT_PATH)
     db.execute(
@@ -2153,9 +2525,9 @@ def np_topk(
     return top_indices, distances[top_indices]
 
 
-# import faiss
 @pytest.mark.skip(reason="TODO")
 def test_correctness_npy():
+    faiss = pytest.importorskip("faiss")
     db = connect(EXT_PATH)
     np.random.seed(420 + 1 + 2)
     mat = np.random.uniform(low=-1.0, high=1.0, size=(10000, 24)).astype(np.float32)
@@ -2209,7 +2581,6 @@ def test_correctness_npy():
 
 
 def test_smoke():
-    db.execute("drop table if exists vec_xyz")
     db.execute("create virtual table vec_xyz using vec0( a float[2] )")
     assert execute_all(
         db,
@@ -2328,7 +2699,6 @@ def test_vec0_stress_small_chunks():
     data = np.zeros((1000, 8), dtype=np.float32)
     for i in range(1000):
         data[i] = np.array([(i + 1) * 0.1] * 8)
-    db.execute("drop table if exists vec_small")
     db.execute("create virtual table vec_small using vec0(chunk_size=8, a float[8])")
     assert execute_all(db, "select rowid, * from vec_small") == []
     with db:
@@ -2468,6 +2838,85 @@ def test_vec0_distance_metric():
     ]
 
 
+def test_vec0_cosine_zero_vector():
+    # zero-magnitude vectors are rejected on cosine tables, since their cosine
+    # distance is undefined (NaN) and would corrupt KNN orderings
+    # https://github.com/vlasky/sqlite-vec/issues/8
+    db = connect(EXT_PATH)
+    db.execute("create virtual table v using vec0(a float[3] distance_metric=cosine)")
+    db.execute("insert into v(rowid, a) values (1, '[1,0,0]'), (3, '[0.9,0.1,0]')")
+
+    with pytest.raises(
+        sqlite3.OperationalError,
+        match=r'A zero-magnitude vector was provided for the "a" column',
+    ):
+        db.execute("insert into v(rowid, a) values (2, '[0,0,0]')")
+
+    with pytest.raises(
+        sqlite3.OperationalError,
+        match=r'A zero-magnitude query vector was provided for the "a" column',
+    ):
+        db.execute("select rowid from v where a match '[0,0,0]' and k = 2").fetchall()
+
+    with pytest.raises(
+        sqlite3.OperationalError,
+        match=r'A zero-magnitude vector was provided for the "a" column',
+    ):
+        db.execute("update v set a = '[0,0,0]' where rowid = 3")
+
+    assert execute_all(
+        db, "select rowid, distance from v where a match '[1,0,0]' and k = 2"
+    ) == [
+        {"rowid": 1, "distance": 0.0},
+        {"rowid": 3, "distance": 0.006116265896707773},
+    ]
+
+    # non-cosine tables still accept zero-magnitude vectors
+    db.execute("create virtual table vl2 using vec0(a float[3])")
+    db.execute("insert into vl2(rowid, a) values (1, '[0,0,0]')")
+    assert execute_all(
+        db, "select rowid, distance from vl2 where a match '[0,0,0]' and k = 1"
+    ) == [{"rowid": 1, "distance": 0.0}]
+
+
+def test_vec0_cosine_extreme_magnitudes():
+    # tiny or huge nonzero vectors used to get +-Inf, NaN or wrong cosine
+    # distances, which ranked them ahead of (or behind) the true nearest
+    # neighbors
+    # https://github.com/asg017/sqlite-vec/issues/324
+    db = connect(EXT_PATH)
+    db.execute("create virtual table v using vec0(a float[2] distance_metric=cosine)")
+    db.executemany(
+        "insert into v(rowid, a) values (?, ?)",
+        [
+            (1, _f32([0.9, 0.1])),
+            (2, _f32([1e-25, 0])),
+            (3, _f32([1e-25, 1e-25])),
+            (4, _f32([-1e-25, 0])),
+            (5, _f32([1e-30, 0])),
+            (6, _f32([3e38, 3e38])),
+        ],
+    )
+
+    expected = [
+        {"rowid": 2, "distance": 0.0},
+        {"rowid": 5, "distance": 0.0},
+        {"rowid": 1, "distance": 0.006116265896707773},
+        {"rowid": 3, "distance": 0.2928932309150696},
+        {"rowid": 6, "distance": 0.2928932309150696},
+        {"rowid": 4, "distance": 2.0},
+    ]
+    for query in ([1, 0], [1e-25, 0], [3e38, 0]):
+        rows = execute_all(
+            db,
+            "select rowid, distance from v where a match ? and k = 6",
+            [_f32(query)],
+        )
+        # the order of equidistant rows is unspecified
+        assert sorted(rows, key=lambda r: (r["distance"], r["rowid"])) == expected
+        assert [r["distance"] for r in rows] == [r["distance"] for r in expected]
+
+
 def test_vec0_vacuum():
     db = connect(EXT_PATH)
     db.execute("create virtual table vec_t using vec0(a float[1]);")
@@ -2513,7 +2962,6 @@ def topk(
 def test_stress1():
     np.random.seed(1234)
     data = np.random.uniform(-1.0, 1.0, (8000, 128)).astype(np.float32)
-    db.execute("drop table if exists vec_stress1")
     db.execute(
         "create virtual table vec_stress1 using vec0( a float[128] distance_metric=cosine)"
     )
@@ -2575,3 +3023,244 @@ def test_coverage():
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_vec0_update_rowid_refused():
+    # vec0 declares a visible "rowid" (or integer primary key) column, so
+    # `set rowid = 9` reaches xUpdate as that column's new value. Moving a row
+    # is not implemented; it used to be ignored while reporting one changed row.
+    # https://github.com/asg017/sqlite-vec/issues/332
+    db.execute("create virtual table t_rowid using vec0(a float[1])")
+    db.execute("insert into t_rowid(rowid, a) values (2, '[1]')")
+    db.execute("create virtual table t_pk using vec0(id integer primary key, a float[1])")
+    db.execute("insert into t_pk(id, a) values (2, '[1]')")
+    for sql in [
+        "update t_rowid set rowid = 9 where rowid = 2",
+        "update t_rowid set rowid = 9, a = '[2]' where rowid = 2",
+        "update t_rowid set rowid = 'x' where rowid = 2",
+        # _rowid_ names SQLite's own rowid, not the declared column, and must
+        # not pass as unchanged because 2.5 truncates to 2
+        "update t_rowid set _rowid_ = 2.5 where rowid = 2",
+        "update t_rowid set _rowid_ = 'x' where rowid = 2",
+        "update t_rowid set _rowid_ = 9 where rowid = 2",
+        "update t_rowid set rowid = 9 where a match '[1]' and k = 1",
+        "update t_pk set id = 9 where id = 2",
+        "update t_pk set id = 9 where a match '[1]' and k = 1",
+    ]:
+        with _raises("UPDATEs on vec0 primary key values are not allowed."):
+            db.execute(sql)
+    # the same value is not a change
+    db.execute("update t_rowid set rowid = 2, a = '[3]' where rowid = 2")
+    db.execute("update t_pk set id = 2, a = '[3]' where id = 2")
+    assert execute_all(db, "select rowid, vec_to_json(a) as a from t_rowid") == [{"rowid": 2, "a": "[3.000000]"}]
+    assert execute_all(db, "select id, vec_to_json(a) as a from t_pk") == [{"id": 2, "a": "[3.000000]"}]
+
+
+def test_vec_distance_l2_extreme_magnitudes():
+    # the f32 sum of squared differences overflowed to Inf above about 1.8e19
+    # and underflowed to 0 below about 1e-19; those sums are now redone in
+    # double. https://github.com/asg017/sqlite-vec/issues/334
+    vec_distance_l2 = lambda a, b: db.execute(
+        "select vec_distance_l2(?, ?)", [_f32(a), _f32(b)]
+    ).fetchone()[0]
+    # 2 elements take the scalar loop, 32 the AVX kernel (x86_64) or the NEON
+    # kernel (arm64) exactly, 40 the NEON kernel with a remainder
+    for pad in [0, 30, 38]:
+        z = [0] * pad
+        for scale in [1e-30, 1e-25, 1e-20, 1e-10, 1.0, 1e10, 1e20, 2e38]:
+            assert isclose(vec_distance_l2([scale, 0] + z, [0, 0] + z), scale, rel_tol=1e-6)
+            assert isclose(vec_distance_l2([0, 0] + z, [0, -scale] + z), scale, rel_tol=1e-6)
+            assert isclose(vec_distance_l2([scale, scale] + z, [0, 0] + z), scale * np.sqrt(2), rel_tol=1e-6)
+            assert vec_distance_l2([scale, 0] + z, [scale, 0] + z) == 0.0
+        # a tiny difference next to an ordinary one is still an ordinary distance
+        assert isclose(vec_distance_l2([1e-25, 3] + z, [0, 0] + z), 3.0, rel_tol=1e-6)
+    # a distance that really does not fit in float32 stays Inf
+    assert vec_distance_l2([3e38, 0], [-3e38, 0]) == float("inf")
+
+
+def test_vec0_l2_extreme_magnitudes():
+    # https://github.com/asg017/sqlite-vec/issues/335
+    for dims in [2, 32, 40]:
+        db.execute(f"create virtual table l2x{dims} using vec0(v float[{dims}])")
+        z = [0] * (dims - 2)
+        db.execute(f"insert into l2x{dims}(rowid, v) values (1, ?)", [_f32([1e20, 0] + z)])
+        db.execute(f"insert into l2x{dims}(rowid, v) values (2, ?)", [_f32([1e-25, 0] + z)])
+        db.execute(f"insert into l2x{dims}(rowid, v) values (3, ?)", [_f32([3, 0] + z)])
+        rows = db.execute(
+            f"select rowid, distance from l2x{dims} where v match ? and k = 3",
+            [_f32([0, 0] + z)],
+        ).fetchall()
+        assert [r[0] for r in rows] == [2, 3, 1]
+        assert isclose(rows[0][1], 1e-25, rel_tol=1e-6)
+        assert rows[1][1] == 3.0
+        assert isclose(rows[2][1], 1e20, rel_tol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "vector, transform, expected",
+    [
+        (b"\x01\x80", "vec_bit(?)", [1] + [0] * 14 + [1]),
+        (
+            "[1,-1,0,2,-2,0,3,-3]",
+            "vec_quantize_binary(?)",
+            [1, 0, 0, 1, 0, 0, 1, 0],
+        ),
+    ],
+)
+def test_vec_each_bit(vector, transform, expected):
+    # vec_each read bits most significant first, while vec_to_json(),
+    # vec_quantize_binary() and the bitmaps themselves are least significant
+    # first. Ported from upstream PR asg017/sqlite-vec#323.
+    assert execute_all(
+        db, f"select rowid, value from vec_each({transform})", [vector]
+    ) == [{"rowid": i, "value": value} for i, value in enumerate(expected)]
+    assert execute_all(db, f"select vec_to_json({transform}) as j", [vector]) == [
+        {"j": "[" + ",".join(str(v) for v in expected) + "]"}
+    ]
+
+
+@pytest.mark.parametrize(
+    "dimensions", [(2**31 - 1) // 255, (2**31 - 1) // 255 + 1, 8_500_001]
+)
+def test_vec_distance_l1_int8_large(dimensions):
+    # the int8 L1 distance summed in 32 bits and wrapped negative from
+    # 8,421,505 elements at opposite extremes. Ported from upstream PR
+    # asg017/sqlite-vec#365.
+    a = bytes([127]) * dimensions
+    b = bytes([128]) * dimensions
+    distance, reverse, identical = db.execute(
+        "select vec_distance_l1(vec_int8(?), vec_int8(?)), "
+        "vec_distance_l1(vec_int8(?), vec_int8(?)), "
+        "vec_distance_l1(vec_int8(?), vec_int8(?))",
+        (a, b, b, a, a, a),
+    ).fetchone()
+    assert type(distance) is int
+    assert distance == dimensions * 255
+    assert reverse == distance
+    assert identical == 0
+
+
+def test_vec0_write_through_knn_plan():
+    # xRowid refused KNN plans, so an UPDATE or DELETE whose WHERE clause was
+    # a KNN query failed with "expected point query plan in vec0Rowid" on
+    # tables without a declared primary key column.
+    db.execute("create virtual table t_knn_write using vec0(a float[1], n integer)")
+    db.executemany(
+        "insert into t_knn_write(rowid, a, n) values (?, ?, 0)",
+        [(1, "[1]"), (2, "[2]"), (3, "[3]")],
+    )
+    db.execute("update t_knn_write set n = 1 where a match '[0]' and k = 2")
+    assert execute_all(db, "select rowid, n from t_knn_write") == [
+        {"rowid": 1, "n": 1},
+        {"rowid": 2, "n": 1},
+        {"rowid": 3, "n": 0},
+    ]
+    db.execute("delete from t_knn_write where a match '[0]' and k = 1")
+    assert execute_all(db, "select rowid, n from t_knn_write") == [
+        {"rowid": 2, "n": 1},
+        {"rowid": 3, "n": 0},
+    ]
+
+
+def test_vec0_quoted_identifiers():
+    # Column names in double quotes, as SQLite allows everywhere else, used to
+    # fail with "Could not parse". https://github.com/asg017/sqlite-vec/issues/170,
+    # after upstream PR asg017/sqlite-vec#296.
+    db.execute(
+        '''create virtual table "t q" using vec0(
+          "id" text primary key,
+          "my vec" float[2],
+          "order" integer,
+          +"the note" text,
+          "tenant" integer partition key,
+          "Year" integer
+        )'''
+    )
+    names = [r["name"] for r in execute_all(db, 'pragma table_xinfo("t q")')]
+    assert names[:6] == ["id", "my vec", "order", "the note", "tenant", "Year"]
+    db.execute(
+        'insert into "t q"(id, "my vec", "order", "the note", tenant, "Year") values (?, ?, ?, ?, ?, ?)',
+        ["a", "[1,1]", 1, "n", 7, 2020],
+    )
+    db.execute(
+        'insert into "t q"(id, "my vec", "order", "the note", tenant, "Year") values (?, ?, ?, ?, ?, ?)',
+        ["b", "[2,2]", 2, "m", 8, 2021],
+    )
+    knn = 'select id, "order", "the note", tenant, "Year" from "t q" where "my vec" match ? and k = 2 and tenant = ? and "order" = ?'
+    assert execute_all(db, knn, ["[1,1]", 7, 1]) == [
+        {"id": "a", "order": 1, "the note": "n", "tenant": 7, "Year": 2020}
+    ]
+    db.execute('update "t q" set "order" = 3, "the note" = \'x\' where id = ?', ["a"])
+    assert execute_all(db, knn, ["[1,1]", 7, 3]) == [
+        {"id": "a", "order": 3, "the note": "x", "tenant": 7, "Year": 2020}
+    ]
+    db.execute('alter table "t q" rename to "t r"')
+    assert execute_all(db, 'select count(*) as n from "t r"') == [{"n": 2}]
+    # empty or containing a quote: rejected, not misread (an unterminated
+    # quote never gets past SQLite's own tokenizer)
+    for definition in ['"" float[2]', '"a""b" float[2]', '"v" float[2], "" integer']:
+        with pytest.raises(sqlite3.OperationalError, match="vec0 constructor error"):
+            db.execute(f"create virtual table bad using vec0({definition})")
+
+
+def test_vec0_partition_in():
+    # internal to the chunks query of KNN searches with a `part in (...)`
+    # constraint: the set arrives through sqlite3_bind_pointer(), so from SQL
+    # the first argument is never a set and the function is always false
+    assert execute_all(db, "select vec0_partition_in(?, 1) as r", [None]) == [{"r": 0}]
+    assert execute_all(db, "select vec0_partition_in(1, 1) as r") == [{"r": 0}]
+    assert execute_all(db, "select vec0_partition_in('a', 'a') as r") == [{"r": 0}]
+    with _raises("wrong number of arguments to function vec0_partition_in()"):
+        db.execute("select vec0_partition_in(1)")
+
+
+def test_vec0_update_validates_before_writing():
+    # an UPDATE with a bad vector, auxiliary or metadata value used to write
+    # the columns before it in the argument order and then fail
+    db.execute("create virtual table t_upd using vec0(a float[2], +note text, year integer)")
+    db.execute("insert into t_upd(rowid, a, note, year) values (1, '[1,1]', 'n', 2020)")
+    for sql, message in [
+        ("update t_upd set note = 'x', year = 2021, a = '[1]' where rowid = 1", "Dimension mismatch"),
+        ("update t_upd set note = 'x', year = 2021, a = 'oops' where rowid = 1", "Updated vector for the \"a\" column is invalid"),
+        ("update t_upd set year = 2021, note = 7 where rowid = 1", "Auxiliary column type mismatch"),
+        ("update t_upd set note = 'x', year = 'y' where rowid = 1", "Expected integer for INTEGER metadata column year"),
+    ]:
+        # the auxiliary type mismatch is SQLITE_CONSTRAINT, the others SQLITE_ERROR
+        with pytest.raises(sqlite3.DatabaseError, match=message):
+            db.execute(sql)
+    assert execute_all(db, "select rowid, vec_to_json(a) as a, note, year from t_upd") == [
+        {"rowid": 1, "a": "[1.000000,1.000000]", "note": "n", "year": 2020}
+    ]
+
+
+def test_vec0_raw_blob_takes_column_type():
+    # a BLOB without a vector subtype whose size matches the column is that
+    # column's kind of vector; vector_from_value() alone reads any plain blob
+    # as float32 (https://github.com/asg017/sqlite-vec/issues/361)
+    db.execute("create virtual table t_raw using vec0(a int8[4], b bit[16], n integer)")
+    db.execute("insert into t_raw(rowid, a, b, n) values (1, ?, ?, 0)", [bytes([1, 2, 255, 128]), bytes([0b00000101, 0b10000000])])
+    assert execute_all(db, "select vec_to_json(a) as a, vec_to_json(b) as b from t_raw") == [
+        {"a": "[1,2,-1,-128]", "b": "[1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,1]"}
+    ]
+    assert execute_all(db, "select rowid from t_raw where a match ? and k = 1", [bytes([1, 2, 255, 128])]) == [{"rowid": 1}]
+    # the wrong size is still parsed as before and rejected
+    with _raises("Inserted vector for the \"a\" column is invalid: invalid float32 vector BLOB length. Must be divisible by 4, found 3"):
+        db.execute("insert into t_raw(rowid, a, b, n) values (2, ?, ?, 0)", [bytes([1, 2, 3]), bytes([0, 0])])
+    with _raises("Inserted vector for the \"a\" column is expected to be of type int8, but a float32 vector was provided."):
+        db.execute("insert into t_raw(rowid, a, b, n) values (2, ?, ?, 0)", [bytes(8), bytes([0, 0])])
+    # UPDATE ... FROM cannot flag the vector columns as unchanged, so their
+    # stored blobs come back as plain blobs and must round-trip
+    db.execute("create table ids(id integer primary key)")
+    db.execute("insert into ids values (1)")
+    db.execute("update t_raw set n = 1 from ids where t_raw.rowid = ids.id")
+    assert execute_all(db, "select vec_to_json(a) as a, vec_to_json(b) as b, n from t_raw") == [
+        {"a": "[1,2,-1,-128]", "b": "[1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,1]", "n": 1}
+    ]
+
+
+def test_vec0_boolean_full_range():
+    db.execute("create virtual table t_bool using vec0(a float[1], flag boolean)")
+    db.execute("insert into t_bool(a, flag) values ('[1]', 1)")
+    for value in [2, -1, 4294967296, 4294967297]:
+        with _raises("Expected 0 or 1 for BOOLEAN metadata column flag"):
+            db.execute("insert into t_bool(a, flag) values ('[1]', ?)", [value])

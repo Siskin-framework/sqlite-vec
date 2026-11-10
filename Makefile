@@ -2,10 +2,16 @@
 COMMIT=$(shell git rev-parse HEAD)
 VERSION=$(shell cat VERSION)
 DATE=$(shell date +'%FT%TZ%z')
+# computed here, not inside the sqlite-vec.h recipe: on FreeBSD's /bin/sh the
+# variable assignments on one command line are all expanded before any is set
+VERSION_MAJOR=$(shell cut -d. -f1 VERSION)
+VERSION_MINOR=$(shell cut -d. -f2 VERSION)
+VERSION_PATCH=$(shell cut -d. -f3 VERSION | cut -d- -f1)
 
-INSTALL_LIB_DIR = /usr/local/lib
-INSTALL_INCLUDE_DIR = /usr/local/include
-INSTALL_BIN_DIR = /usr/local/bin
+INSTALL_PREFIX ?= /usr/local
+INSTALL_LIB_DIR ?= $(INSTALL_PREFIX)/lib
+INSTALL_INCLUDE_DIR ?= $(INSTALL_PREFIX)/include
+INSTALL_BIN_DIR ?= $(INSTALL_PREFIX)/bin
 
 ifndef CC
 CC=gcc
@@ -13,6 +19,10 @@ endif
 ifndef AR
 AR=ar
 endif
+
+# Capture user-provided flags
+EXT_CFLAGS := $(CFLAGS) $(CPPFLAGS)
+EXT_LDFLAGS := $(LDFLAGS)
 
 ifeq ($(shell uname -s),Darwin)
 CONFIG_DARWIN=y
@@ -24,23 +34,53 @@ endif
 
 ifdef CONFIG_DARWIN
 LOADABLE_EXTENSION=dylib
+# Let unresolved SQLite symbols resolve against host at load time
+# This is standard for SQLite loadable extensions on macOS.
+# Skipped for cross-compilers like cosmocc that reject the flag.
+ifeq ($(findstring cosmocc,$(CC)),)
+CFLAGS += -undefined dynamic_lookup
+endif
 endif
 
 ifdef CONFIG_LINUX
 LOADABLE_EXTENSION=so
-CFLAGS += -lm
+LDLIBS += -lm
 endif
 
 ifdef CONFIG_WINDOWS
 LOADABLE_EXTENSION=dll
 endif
 
+
+ifdef python
+PYTHON=$(python)
+else
+PYTHON=python3
+endif
+
 ifndef OMIT_SIMD
-	ifeq ($(shell uname -sm),Darwin x86_64)
-	CFLAGS += -mavx -DSQLITE_VEC_ENABLE_AVX
+	# SIMD follows the compiler's target, not the host: 32-bit Raspberry Pi
+	# OS runs a 64-bit kernel, so uname says aarch64 while gcc targets 32-bit
+	# ARM, and cross-compiles (Android, cosmocc) target something else again.
+	# Android builds stay scalar.
+	ifeq ($(findstring android,$(CC)),)
+	# The compiler's predefined macros, with the user's flags, so that
+	# --target, --sysroot or -m32 in CFLAGS/CPPFLAGS are honoured.
+	TARGET_MACROS=$(shell echo | $(CC) $(EXT_CFLAGS) -dM -E - 2>/dev/null)
+	# The AVX kernels are compiled with per-function target attributes and
+	# used only when the running CPU supports them, so no -mavx: the same
+	# binary runs on any x86-64 CPU.
+	ifneq ($(filter __x86_64__ __amd64__,$(TARGET_MACROS)),)
+	CFLAGS += -DSQLITE_VEC_ENABLE_AVX
 	endif
-	ifeq ($(shell uname -sm),Darwin arm64)
-	CFLAGS += -mcpu=apple-m1 -DSQLITE_VEC_ENABLE_NEON
+	# NEON is in the arm64 baseline (GCC and Clang define __ARM_NEON for
+	# aarch64 with no -m flag), so it needs only the define.
+	ifneq ($(filter __aarch64__,$(TARGET_MACROS)),)
+	CFLAGS += -DSQLITE_VEC_ENABLE_NEON
+	ifneq ($(filter __APPLE__,$(TARGET_MACROS)),)
+	CFLAGS += -mcpu=apple-m1
+	endif
+	endif
 	endif
 endif
 
@@ -88,15 +128,17 @@ $(BUILD_DIR): $(prefix)
 $(TARGET_LOADABLE): sqlite-vec.c sqlite-vec.h $(prefix)
 	$(CC) \
 		-fPIC -shared \
+		-fvisibility=hidden \
 		-Wall -Wextra \
 		-Ivendor/ \
 		-O3 \
-		$(CFLAGS) \
-		$< -o $@
+		$(CFLAGS) $(EXT_CFLAGS) \
+		$< -o $@ \
+		$(EXT_LDFLAGS) $(LDLIBS)
 
 $(TARGET_STATIC): sqlite-vec.c sqlite-vec.h $(prefix) $(OBJS_DIR)
-	$(CC) -Ivendor/ $(CFLAGS) -DSQLITE_CORE -DSQLITE_VEC_STATIC \
-	-O3 -c  $< -o $(OBJS_DIR)/vec.o
+	$(CC) -Ivendor/ -fvisibility=hidden -O3 $(CFLAGS) $(EXT_CFLAGS) -DSQLITE_CORE -DSQLITE_VEC_STATIC \
+	-c  $< -o $(OBJS_DIR)/vec.o
 	$(AR) rcs $@ $(OBJS_DIR)/vec.o
 
 $(TARGET_STATIC_H): sqlite-vec.h $(prefix)
@@ -104,7 +146,7 @@ $(TARGET_STATIC_H): sqlite-vec.h $(prefix)
 
 
 $(OBJS_DIR)/sqlite3.o: vendor/sqlite3.c $(OBJS_DIR)
-	$(CC) -c -g3 -O3 -DSQLITE_EXTRA_INIT=core_init -DSQLITE_CORE -DSQLITE_ENABLE_STMT_SCANSTATUS -DSQLITE_ENABLE_BYTECODE_VTAB -DSQLITE_ENABLE_EXPLAIN_COMMENTS -I./vendor $< -o $@
+	$(CC) -c -g3 -O3 $(EXT_CFLAGS) -DSQLITE_EXTRA_INIT=core_init -DSQLITE_CORE -DSQLITE_ENABLE_STMT_SCANSTATUS -DSQLITE_ENABLE_BYTECODE_VTAB -DSQLITE_ENABLE_EXPLAIN_COMMENTS -I./vendor $< -o $@
 
 $(LIBS_DIR)/sqlite3.a: $(OBJS_DIR)/sqlite3.o $(LIBS_DIR)
 	$(AR) rcs $@ $<
@@ -117,13 +159,14 @@ $(OBJS_DIR)/shell.o: $(BUILD_DIR)/shell-new.c $(OBJS_DIR)
 		-I./vendor \
 		-DSQLITE_ENABLE_STMT_SCANSTATUS -DSQLITE_ENABLE_BYTECODE_VTAB -DSQLITE_ENABLE_EXPLAIN_COMMENTS \
 		-DEXTRA_TODO="\"CUSTOMBUILD:sqlite-vec\n\"" \
+		$(EXT_CFLAGS) \
 		$< -o $@
 
 $(LIBS_DIR)/shell.a: $(OBJS_DIR)/shell.o $(LIBS_DIR)
 	$(AR) rcs $@ $<
 
 $(OBJS_DIR)/sqlite-vec.o: sqlite-vec.c $(OBJS_DIR)
-	$(CC) -c -g3 -Ivendor/ -I./ $(CFLAGS) $< -o $@
+	$(CC) -c -g3 -O3 -fvisibility=hidden -Ivendor/ -I./ $(CFLAGS) $(EXT_CFLAGS) $< -o $@
 
 $(LIBS_DIR)/sqlite-vec.a: $(OBJS_DIR)/sqlite-vec.o $(LIBS_DIR)
 	$(AR) rcs $@ $<
@@ -131,25 +174,32 @@ $(LIBS_DIR)/sqlite-vec.a: $(OBJS_DIR)/sqlite-vec.o $(LIBS_DIR)
 
 $(TARGET_CLI): sqlite-vec.h $(LIBS_DIR)/sqlite-vec.a $(LIBS_DIR)/shell.a $(LIBS_DIR)/sqlite3.a examples/sqlite3-cli/core_init.c $(prefix)
 	$(CC) -g3  \
+	-fvisibility=hidden \
 	-Ivendor/ -I./ \
 	-DSQLITE_CORE \
 	-DSQLITE_VEC_STATIC \
 	-DSQLITE_THREADSAFE=0 -DSQLITE_ENABLE_FTS4 \
 	-DSQLITE_ENABLE_STMT_SCANSTATUS -DSQLITE_ENABLE_BYTECODE_VTAB -DSQLITE_ENABLE_EXPLAIN_COMMENTS \
 	-DSQLITE_EXTRA_INIT=core_init \
-	$(CFLAGS) \
-	-ldl -lm \
-	examples/sqlite3-cli/core_init.c $(LIBS_DIR)/shell.a $(LIBS_DIR)/sqlite3.a $(LIBS_DIR)/sqlite-vec.a -o $@
+	$(CFLAGS) $(EXT_CFLAGS) \
+	$(EXT_LDFLAGS) \
+	examples/sqlite3-cli/core_init.c $(LIBS_DIR)/shell.a $(LIBS_DIR)/sqlite3.a $(LIBS_DIR)/sqlite-vec.a \
+	-ldl -lm -o $@
 
 
 sqlite-vec.h: sqlite-vec.h.tmpl VERSION
-	VERSION=$(shell cat VERSION) \
+	VERSION=$(VERSION) \
 	DATE=$(shell date -r VERSION +'%FT%TZ%z') \
 	SOURCE=$(shell git log -n 1 --pretty=format:%H -- VERSION) \
-	VERSION_MAJOR=$$(echo $$VERSION | cut -d. -f1) \
-	VERSION_MINOR=$$(echo $$VERSION | cut -d. -f2) \
-	VERSION_PATCH=$$(echo $$VERSION | cut -d. -f3 | cut -d- -f1) \
-	envsubst < $< > $@
+	VERSION_MAJOR=$(VERSION_MAJOR) \
+	VERSION_MINOR=$(VERSION_MINOR) \
+	VERSION_PATCH=$(VERSION_PATCH) \
+	envsubst < $< > $@.tmp
+	grep -Eq '^#define SQLITE_VEC_VERSION "[^"]+"' $@.tmp
+	grep -Eq '^#define SQLITE_VEC_VERSION_MAJOR [0-9]+' $@.tmp
+	grep -Eq '^#define SQLITE_VEC_VERSION_MINOR [0-9]+' $@.tmp
+	grep -Eq '^#define SQLITE_VEC_VERSION_PATCH [0-9]+' $@.tmp
+	mv $@.tmp $@
 
 clean:
 	rm -rf dist
@@ -160,7 +210,7 @@ format: $(FORMAT_FILES)
 	clang-format -i $(FORMAT_FILES)
 	black tests/test-loadable.py
 
-lint: SHELL:=/bin/bash
+lint: SHELL:=$(shell command -v bash || echo /bin/bash)
 lint:
 	diff -u <(cat $(FORMAT_FILES)) <(clang-format $(FORMAT_FILES))
 
@@ -181,16 +231,22 @@ publish-release:
 
 # -k test_vec0_update
 test-loadable: loadable
-	uv run --managed-python --project tests pytest -vv -s -x . tests/test-*.py
+	$(PYTHON) -m pytest -vv -s -x tests/test-*.py
 
 test-loadable-snapshot-update: loadable
-	uv run --managed-python --project tests pytest -vv tests/test-loadable.py --snapshot-update
+	$(PYTHON) -m pytest -vv tests/test-loadable.py --snapshot-update
+
+# Update snapshots for all loadable tests (use after intentional behavior changes)
+test-snapshots-update: loadable
+	$(PYTHON) -m pytest -vv tests/test-*.py --snapshot-update
 
 test-loadable-watch:
 	watchexec --exts c,py,Makefile --clear -- make test-loadable
 
-test-unit:
-	$(CC) tests/test-unit.c sqlite-vec.c -I./ -Ivendor -o $(prefix)/test-unit && $(prefix)/test-unit
+# Links SQLite itself: without SQLITE_CORE the sqlite3_* calls in sqlite-vec.c
+# go through the extension API pointer, which is NULL outside a loaded extension.
+test-unit: $(prefix)
+	$(CC) -DSQLITE_CORE tests/test-unit.c sqlite-vec.c vendor/sqlite3.c -I./ -Ivendor -o $(prefix)/test-unit -ldl -lm && $(prefix)/test-unit
 
 site-dev:
 	npm --prefix site run dev
@@ -209,7 +265,7 @@ install:
 		install -m 644 $(TARGET_STATIC) $(INSTALL_LIB_DIR); \
 	fi
 	@if [ -f $(TARGET_CLI) ]; then \
-		sudo install -m 755 $(TARGET_CLI) $(INSTALL_BIN_DIR); \
+		install -m 755 $(TARGET_CLI) $(INSTALL_BIN_DIR); \
 	fi
 	ldconfig
 

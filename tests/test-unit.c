@@ -1,10 +1,415 @@
 #include "../sqlite-vec.h"
+#include "sqlite-vec-internal.h"
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
 
 #define countof(x) (sizeof(x) / sizeof((x)[0]))
 
+// Tests vec0_token_next(), the low-level tokenizer that extracts the next
+// token from a raw char range. Covers every token type (identifier, digit,
+// brackets, plus, equals), whitespace skipping, EOF on empty/whitespace-only
+// input, error on unrecognised characters, and boundary behaviour where
+// identifiers and digits stop at the next non-matching character.
+void test_vec0_token_next() {
+  printf("Starting %s...\n", __func__);
+  struct Vec0Token token;
+  int rc;
+  char *input;
+
+  // Single-character tokens
+  input = "+";
+  rc = vec0_token_next(input, input + 1, &token);
+  assert(rc == VEC0_TOKEN_RESULT_SOME);
+  assert(token.token_type == TOKEN_TYPE_PLUS);
+
+  input = "[";
+  rc = vec0_token_next(input, input + 1, &token);
+  assert(rc == VEC0_TOKEN_RESULT_SOME);
+  assert(token.token_type == TOKEN_TYPE_LBRACKET);
+
+  input = "]";
+  rc = vec0_token_next(input, input + 1, &token);
+  assert(rc == VEC0_TOKEN_RESULT_SOME);
+  assert(token.token_type == TOKEN_TYPE_RBRACKET);
+
+  input = "=";
+  rc = vec0_token_next(input, input + 1, &token);
+  assert(rc == VEC0_TOKEN_RESULT_SOME);
+  assert(token.token_type == TOKEN_TYPE_EQ);
+
+  // Identifier
+  input = "hello";
+  rc = vec0_token_next(input, input + 5, &token);
+  assert(rc == VEC0_TOKEN_RESULT_SOME);
+  assert(token.token_type == TOKEN_TYPE_IDENTIFIER);
+  assert(token.start == input);
+  assert(token.end == input + 5);
+
+  // Identifier with underscores and digits
+  input = "col_1a";
+  rc = vec0_token_next(input, input + 6, &token);
+  assert(rc == VEC0_TOKEN_RESULT_SOME);
+  assert(token.token_type == TOKEN_TYPE_IDENTIFIER);
+  assert(token.end - token.start == 6);
+
+  // Double-quoted identifier: the token includes the quotes
+  input = "\"my col\" rest";
+  rc = vec0_token_next(input, input + 13, &token);
+  assert(rc == VEC0_TOKEN_RESULT_SOME);
+  assert(token.token_type == TOKEN_TYPE_QUOTED_IDENTIFIER);
+  assert(token.start == input);
+  assert(token.end == input + 8);
+
+  // Unterminated or empty quotes are errors
+  input = "\"abc";
+  rc = vec0_token_next(input, input + 4, &token);
+  assert(rc == VEC0_TOKEN_RESULT_ERROR);
+  input = "\"\"";
+  rc = vec0_token_next(input, input + 2, &token);
+  assert(rc == VEC0_TOKEN_RESULT_ERROR);
+
+  // Digit sequence
+  input = "1234";
+  rc = vec0_token_next(input, input + 4, &token);
+  assert(rc == VEC0_TOKEN_RESULT_SOME);
+  assert(token.token_type == TOKEN_TYPE_DIGIT);
+  assert(token.start == input);
+  assert(token.end == input + 4);
+
+  // Leading whitespace is skipped
+  input = "  abc";
+  rc = vec0_token_next(input, input + 5, &token);
+  assert(rc == VEC0_TOKEN_RESULT_SOME);
+  assert(token.token_type == TOKEN_TYPE_IDENTIFIER);
+  assert(token.end - token.start == 3);
+
+  // Tab/newline whitespace
+  input = "\t\n\r X";
+  rc = vec0_token_next(input, input + 5, &token);
+  assert(rc == VEC0_TOKEN_RESULT_SOME);
+  assert(token.token_type == TOKEN_TYPE_IDENTIFIER);
+
+  // Empty input
+  input = "";
+  rc = vec0_token_next(input, input, &token);
+  assert(rc == VEC0_TOKEN_RESULT_EOF);
+
+  // Only whitespace
+  input = "   ";
+  rc = vec0_token_next(input, input + 3, &token);
+  assert(rc == VEC0_TOKEN_RESULT_EOF);
+
+  // Unrecognized character
+  input = "@";
+  rc = vec0_token_next(input, input + 1, &token);
+  assert(rc == VEC0_TOKEN_RESULT_ERROR);
+
+  input = "!";
+  rc = vec0_token_next(input, input + 1, &token);
+  assert(rc == VEC0_TOKEN_RESULT_ERROR);
+
+  // Identifier stops at bracket
+  input = "foo[";
+  rc = vec0_token_next(input, input + 4, &token);
+  assert(rc == VEC0_TOKEN_RESULT_SOME);
+  assert(token.token_type == TOKEN_TYPE_IDENTIFIER);
+  assert(token.end - token.start == 3);
+
+  // Digit stops at non-digit
+  input = "42abc";
+  rc = vec0_token_next(input, input + 5, &token);
+  assert(rc == VEC0_TOKEN_RESULT_SOME);
+  assert(token.token_type == TOKEN_TYPE_DIGIT);
+  assert(token.end - token.start == 2);
+
+  printf("  All vec0_token_next tests passed.\n");
+}
+
+// Tests Vec0Scanner, the stateful wrapper around vec0_token_next() that
+// tracks position and yields successive tokens. Verifies correct tokenisation
+// of full sequences like "abc float[128]" and "key=value", empty input,
+// whitespace-heavy input, and expressions with operators ("a+b").
+void test_vec0_scanner() {
+  printf("Starting %s...\n", __func__);
+  struct Vec0Scanner scanner;
+  struct Vec0Token token;
+  int rc;
+
+  // Scan "abc float[128]"
+  {
+    const char *input = "abc float[128]";
+    vec0_scanner_init(&scanner, input, (int)strlen(input));
+
+    rc = vec0_scanner_next(&scanner, &token);
+    assert(rc == VEC0_TOKEN_RESULT_SOME);
+    assert(token.token_type == TOKEN_TYPE_IDENTIFIER);
+    assert(token.end - token.start == 3);
+    assert(strncmp(token.start, "abc", 3) == 0);
+
+    rc = vec0_scanner_next(&scanner, &token);
+    assert(rc == VEC0_TOKEN_RESULT_SOME);
+    assert(token.token_type == TOKEN_TYPE_IDENTIFIER);
+    assert(token.end - token.start == 5);
+    assert(strncmp(token.start, "float", 5) == 0);
+
+    rc = vec0_scanner_next(&scanner, &token);
+    assert(rc == VEC0_TOKEN_RESULT_SOME);
+    assert(token.token_type == TOKEN_TYPE_LBRACKET);
+
+    rc = vec0_scanner_next(&scanner, &token);
+    assert(rc == VEC0_TOKEN_RESULT_SOME);
+    assert(token.token_type == TOKEN_TYPE_DIGIT);
+    assert(strncmp(token.start, "128", 3) == 0);
+
+    rc = vec0_scanner_next(&scanner, &token);
+    assert(rc == VEC0_TOKEN_RESULT_SOME);
+    assert(token.token_type == TOKEN_TYPE_RBRACKET);
+
+    rc = vec0_scanner_next(&scanner, &token);
+    assert(rc == VEC0_TOKEN_RESULT_EOF);
+  }
+
+  // Scan "key=value"
+  {
+    const char *input = "key=value";
+    vec0_scanner_init(&scanner, input, (int)strlen(input));
+
+    rc = vec0_scanner_next(&scanner, &token);
+    assert(rc == VEC0_TOKEN_RESULT_SOME);
+    assert(token.token_type == TOKEN_TYPE_IDENTIFIER);
+    assert(strncmp(token.start, "key", 3) == 0);
+
+    rc = vec0_scanner_next(&scanner, &token);
+    assert(rc == VEC0_TOKEN_RESULT_SOME);
+    assert(token.token_type == TOKEN_TYPE_EQ);
+
+    rc = vec0_scanner_next(&scanner, &token);
+    assert(rc == VEC0_TOKEN_RESULT_SOME);
+    assert(token.token_type == TOKEN_TYPE_IDENTIFIER);
+    assert(strncmp(token.start, "value", 5) == 0);
+
+    rc = vec0_scanner_next(&scanner, &token);
+    assert(rc == VEC0_TOKEN_RESULT_EOF);
+  }
+
+  // Scan empty string
+  {
+    const char *input = "";
+    vec0_scanner_init(&scanner, input, 0);
+
+    rc = vec0_scanner_next(&scanner, &token);
+    assert(rc == VEC0_TOKEN_RESULT_EOF);
+  }
+
+  // Scan with lots of whitespace
+  {
+    const char *input = "  a   b  ";
+    vec0_scanner_init(&scanner, input, (int)strlen(input));
+
+    rc = vec0_scanner_next(&scanner, &token);
+    assert(rc == VEC0_TOKEN_RESULT_SOME);
+    assert(token.token_type == TOKEN_TYPE_IDENTIFIER);
+    assert(token.end - token.start == 1);
+    assert(*token.start == 'a');
+
+    rc = vec0_scanner_next(&scanner, &token);
+    assert(rc == VEC0_TOKEN_RESULT_SOME);
+    assert(token.token_type == TOKEN_TYPE_IDENTIFIER);
+    assert(token.end - token.start == 1);
+    assert(*token.start == 'b');
+
+    rc = vec0_scanner_next(&scanner, &token);
+    assert(rc == VEC0_TOKEN_RESULT_EOF);
+  }
+
+  // Scan "a+b"
+  {
+    const char *input = "a+b";
+    vec0_scanner_init(&scanner, input, (int)strlen(input));
+
+    rc = vec0_scanner_next(&scanner, &token);
+    assert(rc == VEC0_TOKEN_RESULT_SOME);
+    assert(token.token_type == TOKEN_TYPE_IDENTIFIER);
+
+    rc = vec0_scanner_next(&scanner, &token);
+    assert(rc == VEC0_TOKEN_RESULT_SOME);
+    assert(token.token_type == TOKEN_TYPE_PLUS);
+
+    rc = vec0_scanner_next(&scanner, &token);
+    assert(rc == VEC0_TOKEN_RESULT_SOME);
+    assert(token.token_type == TOKEN_TYPE_IDENTIFIER);
+
+    rc = vec0_scanner_next(&scanner, &token);
+    assert(rc == VEC0_TOKEN_RESULT_EOF);
+  }
+
+  printf("  All vec0_scanner tests passed.\n");
+}
+
+// Tests vec0_parse_vector_column(), which parses a vec0 column definition
+// string like "embedding float[768] distance_metric=cosine" into a
+// VectorColumnDefinition struct. Covers all element types (float/f32, int8/i8,
+// bit), column names with underscores/digits, all distance metrics (L2, L1,
+// cosine), the default metric, and error cases: empty input, missing type,
+// unknown type, missing dimensions, unknown metric, unknown option key, and
+// distance_metric on bit columns.
+void test_vec0_parse_vector_column() {
+  printf("Starting %s...\n", __func__);
+  struct VectorColumnDefinition col;
+  int rc;
+
+  // Basic float column
+  {
+    const char *input = "embedding float[768]";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col);
+    assert(rc == SQLITE_OK);
+    assert(col.name_length == 9);
+    assert(strncmp(col.name, "embedding", 9) == 0);
+    assert(col.element_type == SQLITE_VEC_ELEMENT_TYPE_FLOAT32);
+    assert(col.dimensions == 768);
+    assert(col.distance_metric == VEC0_DISTANCE_METRIC_L2);
+    sqlite3_free(col.name);
+  }
+
+  // f32 alias
+  {
+    const char *input = "v f32[3]";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col);
+    assert(rc == SQLITE_OK);
+    assert(col.element_type == SQLITE_VEC_ELEMENT_TYPE_FLOAT32);
+    assert(col.dimensions == 3);
+    sqlite3_free(col.name);
+  }
+
+  // int8 column
+  {
+    const char *input = "quantized int8[256]";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col);
+    assert(rc == SQLITE_OK);
+    assert(col.element_type == SQLITE_VEC_ELEMENT_TYPE_INT8);
+    assert(col.dimensions == 256);
+    assert(col.name_length == 9);
+    assert(strncmp(col.name, "quantized", 9) == 0);
+    sqlite3_free(col.name);
+  }
+
+  // i8 alias
+  {
+    const char *input = "q i8[64]";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col);
+    assert(rc == SQLITE_OK);
+    assert(col.element_type == SQLITE_VEC_ELEMENT_TYPE_INT8);
+    assert(col.dimensions == 64);
+    sqlite3_free(col.name);
+  }
+
+  // bit column
+  {
+    const char *input = "bvec bit[1024]";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col);
+    assert(rc == SQLITE_OK);
+    assert(col.element_type == SQLITE_VEC_ELEMENT_TYPE_BIT);
+    assert(col.dimensions == 1024);
+    sqlite3_free(col.name);
+  }
+
+  // Column name with underscores and digits
+  {
+    const char *input = "col_name_2 float[10]";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col);
+    assert(rc == SQLITE_OK);
+    assert(col.name_length == 10);
+    assert(strncmp(col.name, "col_name_2", 10) == 0);
+    sqlite3_free(col.name);
+  }
+
+  // distance_metric=cosine
+  {
+    const char *input = "emb float[128] distance_metric=cosine";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col);
+    assert(rc == SQLITE_OK);
+    assert(col.distance_metric == VEC0_DISTANCE_METRIC_COSINE);
+    assert(col.dimensions == 128);
+    sqlite3_free(col.name);
+  }
+
+  // distance_metric=L2 (explicit)
+  {
+    const char *input = "emb float[128] distance_metric=L2";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col);
+    assert(rc == SQLITE_OK);
+    assert(col.distance_metric == VEC0_DISTANCE_METRIC_L2);
+    sqlite3_free(col.name);
+  }
+
+  // distance_metric=L1
+  {
+    const char *input = "emb float[128] distance_metric=l1";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col);
+    assert(rc == SQLITE_OK);
+    assert(col.distance_metric == VEC0_DISTANCE_METRIC_L1);
+    sqlite3_free(col.name);
+  }
+
+  // Error: empty string
+  {
+    const char *input = "";
+    rc = vec0_parse_vector_column(input, 0, &col);
+    assert(rc != SQLITE_OK);
+  }
+
+  // Error: no type
+  {
+    const char *input = "emb";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col);
+    assert(rc != SQLITE_OK);
+  }
+
+  // Error: unknown type
+  {
+    const char *input = "emb double[128]";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col);
+    assert(rc != SQLITE_OK);
+  }
+
+  // Error: missing dimensions
+  {
+    const char *input = "emb float";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col);
+    assert(rc != SQLITE_OK);
+  }
+
+  // Error: unknown distance metric
+  {
+    const char *input = "emb float[128] distance_metric=hamming";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col);
+    assert(rc != SQLITE_OK);
+  }
+
+  // Error: unknown option key
+  {
+    const char *input = "emb float[128] foobar=baz";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col);
+    assert(rc != SQLITE_OK);
+  }
+
+  // Error: distance_metric on bit type
+  {
+    const char *input = "emb bit[64] distance_metric=cosine";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col);
+    assert(rc != SQLITE_OK);
+  }
+
+  printf("  All vec0_parse_vector_column tests passed.\n");
+}
+
+// Tests vec0_parse_partition_key_definition(), which parses a vec0 partition
+// key column definition like "user_id integer partition key". Verifies correct
+// parsing of integer and text partition keys, column name extraction, and
+// rejection of invalid inputs: empty strings, non-partition-key definitions
+// ("primary key"), and misspelled keywords.
 void test_vec0_parse_partition_key_definition() {
   printf("Starting %s...\n", __func__);
   typedef struct {
@@ -35,7 +440,6 @@ void test_vec0_parse_partition_key_definition() {
       &out_column_name_length,
       &out_column_type
     );
-    printf("2\n");
     assert(rc == suite[i].expected_rc);
 
     if(rc == SQLITE_OK) {
@@ -44,11 +448,144 @@ void test_vec0_parse_partition_key_definition() {
       assert(out_column_type == suite[i].expected_column_type);
     }
 
-    printf("✅ %s\n", suite[i].test);
+    printf("  Passed: \"%s\"\n", suite[i].test);
   }
+}
+
+// Runs a full scan of a 16-row, two-chunk vec0 table and, after `stopAt` rows,
+// rolls back a transaction that changed the schema on the same connection. That
+// rollback invalidates the scan's blob handle, which then answers
+// SQLITE_ABORT_ROLLBACK when the connection has extended result codes on; the
+// scan must replace the handle and return every row, as with them off.
+static void fullscan_across_schema_rollback(int extendedCodes, int stopAt) {
+  sqlite3 *db;
+  sqlite3_stmt *stmt;
+  int rc = sqlite3_open(":memory:", &db);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_vec_init(db, NULL, NULL);
+  assert(rc == SQLITE_OK);
+  sqlite3_extended_result_codes(db, extendedCodes);
+  rc = sqlite3_exec(
+      db, "create virtual table v using vec0(a float[2], chunk_size=8)", 0, 0,
+      0);
+  assert(rc == SQLITE_OK);
+  for (int i = 1; i <= 16; i++) {
+    char sql[64];
+    snprintf(sql, sizeof sql, "insert into v(rowid, a) values (%d, '[%d, 0]')",
+             i, i);
+    rc = sqlite3_exec(db, sql, 0, 0, 0);
+    assert(rc == SQLITE_OK);
+  }
+  rc = sqlite3_prepare_v2(db, "select rowid, a from v", -1, &stmt, 0);
+  assert(rc == SQLITE_OK);
+  int rows = 0;
+  while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+    rows++;
+    assert(sqlite3_column_int64(stmt, 0) == rows);
+    assert(((const float *)sqlite3_column_blob(stmt, 1))[0] == rows);
+    if (rows == stopAt) {
+      int rrc =
+          sqlite3_exec(db, "begin; create table u(y); rollback;", 0, 0, 0);
+      assert(rrc == SQLITE_OK);
+    }
+  }
+  assert(rc == SQLITE_DONE);
+  assert(rows == 16);
+  sqlite3_finalize(stmt);
+  sqlite3_close(db);
+}
+
+void test_vec0_fullscan_schema_rollback() {
+  printf("Starting %s...\n", __func__);
+  for (int extendedCodes = 0; extendedCodes <= 1; extendedCodes++) {
+    // Mid-chunk the read fails; at a chunk's last row the next reopen does.
+    fullscan_across_schema_rollback(extendedCodes, 3);
+    fullscan_across_schema_rollback(extendedCodes, 8);
+  }
+}
+
+// the public header declares only sqlite3_vec_init()
+int sqlite3_vec_static_blobs_init(sqlite3 *db, char **pzErrMsg,
+                                  const sqlite3_api_routines *pApi);
+
+// Returns sqlite3_memory_used() after a connection that ran one KNN query over
+// a 64-vector static blob has been closed. The blob is the inner loop of a
+// join with nOuter driving rows, so SQLite filters the same cursor nOuter
+// times without closing it in between, and results the filter does not free
+// before it allocates new ones show up as memory left behind.
+static sqlite3_int64 static_blob_memory_after(int nOuter) {
+  static float vectors[64][4];
+  for (int i = 0; i < 64; i++) {
+    for (int j = 0; j < 4; j++) {
+      vectors[i][j] = (float)i / 64 + (float)j;
+    }
+  }
+  sqlite3 *db;
+  sqlite3_stmt *stmt;
+  int rc = sqlite3_open(":memory:", &db);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_vec_init(db, NULL, NULL);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_vec_static_blobs_init(db, NULL, NULL);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_prepare_v2(db,
+                          "insert into temp.vec_static_blobs(name, data) "
+                          "select 'w', vec_static_blob_from_raw(?, '<f4', 4, 64)",
+                          -1, &stmt, 0);
+  assert(rc == SQLITE_OK);
+  sqlite3_bind_int64(stmt, 1, (sqlite3_int64)(intptr_t)vectors);
+  rc = sqlite3_step(stmt);
+  assert(rc == SQLITE_DONE);
+  sqlite3_finalize(stmt);
+  char *zErr = NULL;
+  rc = sqlite3_exec(db, "create virtual table w using vec_static_blob_entries(w)",
+                    0, 0, &zErr);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "create virtual table failed: %s\n", zErr);
+  }
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "create table q(v blob)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  for (int i = 0; i < nOuter; i++) {
+    rc = sqlite3_exec(db,
+                      "insert into q(v) values (vec_f32('[0.5, 1.5, 2.5, 3.5]'))",
+                      0, 0, 0);
+    assert(rc == SQLITE_OK);
+  }
+  rc = sqlite3_prepare_v2(db,
+                          "select w.rowid from q cross join w "
+                          "where w.vector match q.v and k = 2 order by distance",
+                          -1, &stmt, 0);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "prepare failed: %s\n", sqlite3_errmsg(db));
+  }
+  assert(rc == SQLITE_OK);
+  int rows = 0;
+  while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+    rows++;
+  }
+  assert(rc == SQLITE_DONE);
+  assert(rows == 2 * nOuter);
+  sqlite3_finalize(stmt);
+  rc = sqlite3_close(db);
+  assert(rc == SQLITE_OK);
+  return sqlite3_memory_used();
+}
+
+void test_vec_static_blob_entries_refilter() {
+  printf("Starting %s...\n", __func__);
+  sqlite3_int64 once = static_blob_memory_after(1);
+  sqlite3_int64 thrice = static_blob_memory_after(3);
+  assert(thrice == once);
 }
 
 int main() {
   printf("Starting unit tests...\n");
+  test_vec0_token_next();
+  test_vec0_scanner();
+  test_vec0_parse_vector_column();
   test_vec0_parse_partition_key_definition();
+  test_vec0_fullscan_schema_rollback();
+  test_vec_static_blob_entries_refilter();
+  printf("All unit tests passed.\n");
 }
